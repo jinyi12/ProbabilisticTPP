@@ -5,27 +5,33 @@ from easy_tpp.config_factory import DataSpecConfig
 
 
 class GRUTPPEncoder(nn.Module):
-    """Neural Temporal Point Process Encoder with right padding, GRU and event type embeddings
+    """
+    This module implements a neural marked temporal point process using a Gated Recurrent Unit (GRU).
 
-    The encoder processes event sequences with right padding using a GRU. The input
-    consists of event type embeddings, time deltas and time since start. The output
-    is a sequence of encoded representations.
-
-    The encoder first embeds event types using an embedding layer. The embeddings are
-    concatenated with time deltas and time since start. The combined features are then
-    processed through a GRU. The final hidden states are normalized and returned.
+    The process involves encoding the input sequence of events with their associated marks and timestamps.
+    Each event is processed through a GRU. The final hidden state is projected to predict the time
+    until the next event and the mark of the next event. The model is trained to minimize the
+    negative log-likelihood of the observed sequence of events.
 
     Args:
-        config (DataSpecConfig): Configuration specifying data properties
-        emb_dim (int): Dimension of event type embeddings
-        hidden_dim (int): Hidden dimension of GRU
-        num_layers (int): Number of GRU layers
-        dropout (float): Dropout rate
+        config (DataSpecConfig): Configuration specifying data properties.
+        emb_dim (int): Dimension of event type embeddings.
+        hidden_dim (int): Hidden dimension of GRU.
+        mlp_dim (int): Dimension of the MLP layer.
+        num_layers (int): Number of GRU layers.
+        dropout (float): Dropout rate.
 
-    Returns:
-        dict: Dictionary containing:
-            - hidden_states: Encoded representations [batch_size, seq_len, hidden_dim]
-            - sequence_length: Original sequence lengths
+    Methods:
+        forward(batch): Defines the forward pass of the encoder.
+            Args:
+                batch (dict): Dictionary containing preprocessed tensors:
+                    - type_seqs: Event type sequences [batch_size, seq_len].
+                    - time_seqs: Absolute time sequences [batch_size, seq_len].
+                    - time_delta_seqs: Time delta sequences [batch_size, seq_len].
+                    - sequence_length: Original sequence lengths before padding.
+            Returns:
+                time_output: Predicted time until next event [batch_size, 1].
+                event_type_logits: Predicted event type log probabilities [batch_size, num_event].
     """
 
     def __init__(
@@ -33,6 +39,7 @@ class GRUTPPEncoder(nn.Module):
         config: DataSpecConfig,
         emb_dim=32,
         hidden_dim=64,
+        mlp_dim=64,
         num_layers=2,
         dropout=0.1,
     ):
@@ -57,7 +64,11 @@ class GRUTPPEncoder(nn.Module):
         )
 
         # Output projection
-        self.output_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.mlp = nn.Linear(hidden_dim, mlp_dim)
+        self.event_type_projection = nn.Linear(mlp_dim, config.num_event_types)
+        self.time_projection = nn.Linear(mlp_dim, 1)
+
+        # Dropout
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, batch):
@@ -71,14 +82,14 @@ class GRUTPPEncoder(nn.Module):
                 - sequence_length: Original sequence lengths before padding
 
         Returns:
-            dict: Dictionary containing:
-                - hidden_states: Encoded representations [batch_size, seq_len, hidden_dim]
-                - sequence_length: Original sequence lengths
+            time_output: Predicted time until next event [batch_size, 1]
+            event_type_logits: Predicted event type log probabilities [batch_size, num_event]
         """
         batch_size = batch["type_seqs"].size(0)
 
         # Get embeddings for event types
         event_embeddings = self.event_embedding(batch["type_seqs"])  # [B, L, E]
+        event_embeddings = self.dropout(event_embeddings)
 
         # Stack temporal features
         time_features = torch.stack(
@@ -106,9 +117,11 @@ class GRUTPPEncoder(nn.Module):
             packed_output, batch_first=True, padding_value=0
         )
 
-        # Final processing
-        output = self.dropout(output)
-        output = self.output_layer(output)
-        output = F.normalize(output, p=2, dim=-1)
+        # Project to event types and time
+        mlp_output = torch.sigmoid(self.mlp(output[:, -1, :]))
+        event_type_logits = F.log_softmax(
+            self.event_type_projection(mlp_output), dim=-1
+        )  # applied across last dimension
+        time_output = self.time_projection(mlp_output)
 
-        return {"hidden_states": output, "sequence_length": batch["sequence_length"]}
+        return time_output, event_type_logits
