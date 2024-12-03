@@ -94,6 +94,9 @@ class GRUTPPEncoder(nn.Module):
             [event_embeddings, time_features], dim=-1
         )  # [B, L, E+2]
 
+        # sequence length before packing
+        max_seq_len = batch["type_seqs"].size(1)
+
         # Pack padded sequence
         packed_input = nn.utils.rnn.pack_padded_sequence(
             combined_features,
@@ -107,14 +110,13 @@ class GRUTPPEncoder(nn.Module):
 
         # Unpack sequence
         hidden_states, _ = nn.utils.rnn.pad_packed_sequence(
-            packed_output, batch_first=True, padding_value=0
+            packed_output,
+            batch_first=True,
+            padding_value=0,
+            total_length=max_seq_len,
         )
 
-        # # Project to event types and time
-        # mlp_output = torch.sigmoid(self.mlp(output[:, -1, :]))
-        # event_type_logits = F.log_softmax(
-        #     self.event_type_projection(mlp_output), dim=-1
-        # )  # applied across last dimension
-        # time_output = self.time_projection(mlp_output)
+        # print("Shape of combined features: ", combined_features.shape)
+        # print("Shape of hidden states: ", hidden_states.shape)
 
         return hidden_states
