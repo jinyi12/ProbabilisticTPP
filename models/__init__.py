@@ -38,11 +38,10 @@ class VAETPPModel(nn.Module):
         super(VAETPPModel, self).__init__()
         self.encoder = GRUTPPEncoder(config, hidden_dim=hidden_dim)
         self.decoder = VAETPPDecoder(
-            hidden_dim=hidden_dim,
-            latent_dim = latent_dim,
-            num_event_types=config.num_event_types,
-            mlp_dim=mlp_dim,
-            device=device,
+            n_in=hidden_dim,             
+            n_hid=mlp_dim,              
+            z_dim=latent_dim,            
+            num_event_types=config.num_event_types
         )
         self.criterion = VAETPPLoss(
             device=device, ignore_index=config.pad_token_id, decoder=self.decoder
