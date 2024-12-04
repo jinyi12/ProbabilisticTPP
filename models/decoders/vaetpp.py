@@ -71,10 +71,12 @@ class VAETPPDecoder(nn.Module):
         stdev = torch.exp(0.5*logvar)
         eps = torch.randn_like(stdev)
         return mu + eps*stdev
+        
     def decode(self, z):
         """Implements decoder forward pass."""
         h3 = F.relu(self.fc3(z))
         return self.mlp(h3)
+        
     def encode(self, x):
         """Encoder forward pass."""
         return self.fc21(x), self.fc22(x)
@@ -97,6 +99,8 @@ class VAETPPDecoder(nn.Module):
         
         # Encode to latent space, sample + decode latent vector, send through MLP
         mu, logvar = self.encode(hidden_states)
+        # clamp
+        logvar = torch.clamp(logvar, min=-10, max=10)
         z = self.reparameterize(mu, logvar)
         mlp_output = self.decode(z)
         
