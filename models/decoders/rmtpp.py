@@ -176,7 +176,7 @@ class RMTPPLoss(nn.Module):
         base_intensity = self.decoder.intensity_b
         intensity_integral = self.compute_intensity_integral(time_output, time_target)
 
-        # negative log likelihood of TPP
+        # log likelihood of TPP
         time_loglikelihood = (
             time_output
             + self.decoder.intensity_w * time_target

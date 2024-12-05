@@ -9,136 +9,111 @@ class VAEDecoderOutput(NamedTuple):
     """Container for decoder outputs to make the interface cleaner"""
 
     time_output: torch.Tensor  # Predicted time until next event
-    # time_delta: torch.Tensor  # Predicted time delta
     mark_logits: torch.Tensor  # Log probabilities for marks
-    # intensity_integral: torch.Tensor  # Integral of intensity function
     base_intensity: torch.Tensor  # Base intensity values
     mu: torch.Tensor
     logvar: torch.Tensor
 
+
 class VAETPPDecoder(nn.Module):
-    """
-    Decoder implementation for TPP using VAE.
-    Computes marked intensity integral and predicts both time and marks with VAE.
-    
-    Args:
-        hidden_dim (int): Dimension of the hidden state from encoder
-        latent_dim (int): Dimension of latent space
-        num_event_types (int): Number of possible event types/marks
-        mlp_dim (int): Dimension of the MLP layer
-        device (torch.device): Device to place the model parameters on
-    """
-    def __init__(self, 
-        hidden_dim: int, 
-        latent_dim: int,
-        num_event_types: int, 
-        mlp_dim: int, 
-        device: torch.device
-    ):
-        super(VAETPPDecoder, self).__init__()               
-        self.latent_dim = latent_dim
-        self.fc21 = nn.Linear(hidden_dim, latent_dim)
-        self.fc22 = nn.Linear(hidden_dim, latent_dim)
-        self.fc3 = nn.Linear(latent_dim, hidden_dim)
-        
+    def __init__(self, n_in, n_hid, z_dim, num_event_types):
+        """
+        Args:
+            n_in (int): Dimension of the input features (hidden states from encoder).
+            n_hid (int): Dimension of the hidden layer.
+            z_dim (int): Dimension of the latent space.
+            num_event_types (int): Number of event types for classification.
+        """
+        super().__init__()
+
+        self.fc1 = nn.Linear(n_in, n_hid)  # Input to hidden
+        self.fc21 = nn.Linear(n_hid, z_dim)  # Hidden to latent mean
+        self.fc22 = nn.Linear(n_hid, z_dim)  # Hidden to latent log variance
+        self.fc3 = nn.Linear(z_dim, n_hid)  # Latent to hidden
+        self.fc4_time = nn.Linear(n_hid, 1)  # Hidden to time output
+        self.fc4_mark = nn.Linear(n_hid, num_event_types)  # Hidden to mark logits
+
         # Intensity function parameters
-        self.intensity_w = nn.Parameter(torch.tensor(0.1, dtype=torch.float, device=device))
-        self.intensity_b = nn.Parameter(torch.tensor(0.1, dtype=torch.float, device=device))
-        
-        # MLP for hidden state processing
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, mlp_dim),
-            nn.Sigmoid()
-        )
-        
-        # Output projections
-        self.mark_projection = nn.Linear(mlp_dim, num_event_types)
-        self.time_projection = nn.Linear(mlp_dim, 1)
-        
-        self.device = device
+        self.intensity_w = nn.Parameter(torch.tensor(0.1, dtype=torch.float))
+        self.intensity_b = nn.Parameter(torch.tensor(0.1, dtype=torch.float))
+
+        # Activation functions
+        self.softplus = nn.Softplus()
+        self.silu = nn.SiLU()
+
+    def encode(self, x, eps=1e-8):
+        """Encoder forward pass: encodes input data to the latent space."""
+        h1 = self.silu(self.fc1(x))  # Activation with SiLU
+        mu = self.fc21(h1)  # Mean of the latent space
+        logvar = self.fc22(h1)  # Log variance of the latent space
+        logvar_pos = self.softplus(logvar) + eps  # Ensure positive variance
+        return mu, logvar_pos
 
     def reparameterize(self, mu, logvar):
-        """
-        Implements: z = mu + epsilon*stdev.
-        
-        Args: 
-            mu: Mean of the latent distribution
-            logvar: Log var of the latent distribution
-            
-        Returns:
-            Sampled latent vector
-        """
-        stdev = torch.exp(0.5*logvar)
-        eps = torch.randn_like(stdev)
-        return mu + eps*stdev
-        
+        """Reparameterization trick: z = mu + epsilon * stddev."""
+        std = torch.exp(0.5 * logvar)  # Standard deviation
+        eps = torch.randn_like(std)  # Sample noise
+        return mu + eps * std
+
     def decode(self, z):
-        """Implements decoder forward pass."""
-        h3 = F.relu(self.fc3(z))
-        return self.mlp(h3)
-        
-    def encode(self, x):
-        """Encoder forward pass."""
-        return self.fc21(x), self.fc22(x)
+        """Decoder forward pass: decodes latent space data to output space."""
+        # h3 = self.silu(self.fc3(z))  # Activation with SiLU
+        h3 = F.sigmoid(self.fc3(z))  # Activation with Sigmoid
+        time_output = self.fc4_time(h3)  # Predict time until next event
+        mark_logits = self.fc4_mark(h3)  # Predict event type logits
+        return time_output, mark_logits
 
     def forward(self, hidden_states: torch.Tensor) -> VAEDecoderOutput:
         """
-        Forward pass of the VAE decoder.
-        
+        Forward pass: encodes, reparameterizes, and decodes input data.
+
         Args:
-            hidden_states: Hidden states from encoder [batch_size, seq_len, hidden_dim]
-            
+            hidden_states (torch.Tensor): Input features (e.g., hidden states from an encoder).
+
         Returns:
-            VAEDecoderOutput containing:
-                - time_delta: Predicted time until next event
-                - mark_logits: Log probabilities for each mark
-                - intensity_integral: Integral of intensity function
-                - base_intensity: Base intensity values
+            VAEDecoderOutput: Predicted time, marks, and latent parameters.
         """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Encode to latent space, sample + decode latent vector, send through MLP
-        mu, logvar = self.encode(hidden_states)
-        # clamp
-        logvar = torch.clamp(logvar, min=-10, max=10)
-        z = self.reparameterize(mu, logvar)
-        mlp_output = self.decode(z)
-        
-        # Get base intensity and time prediction
-        time_output = self.time_projection(mlp_output)
-        base_intensity = self.intensity_b
-        
-        # Compute mark probabilities
-        mark_logits = self.mark_projection(mlp_output)
-        mark_logits = F.log_softmax(mark_logits, dim=-1)
-        
-        # get elbo, recon kld losses     
+        mu, logvar = self.encode(hidden_states)  # Encode to latent space
+        z = self.reparameterize(mu, logvar)  # Sample latent representation
+        time_output, mark_logits = self.decode(z)  # Decode to outputs
+
+        mark_logits = F.log_softmax(mark_logits, dim=-1)  # Log probabilities for marks
+
+        # Return predictions and latent space parameters
         return VAEDecoderOutput(
             time_output=time_output,
             mark_logits=mark_logits,
-            base_intensity=base_intensity,
-            mu = mu,
-            logvar = logvar
+            base_intensity=self.intensity_b,
+            mu=mu,
+            logvar=logvar,
         )
 
+
 class VAETPPLoss(nn.Module):
-    """
-    Loss computation for VAETPP.
-    Combines TPP likelihood loss with VAE ELBO loss.
-    """
     def __init__(
         self,
         device: torch.device,
-        decoder: VAETPPDecoder,  
+        decoder: VAETPPDecoder,
         event_weights: Optional[torch.Tensor] = None,
         ignore_index: int = None,
-        beta: float = 1.0,  # Weight for KLD term
+        beta_start=0.0,
+        beta_end=1.0,
+        n_steps: int = 1000,
+        warmup_steps: int = 1000,
+        l1_lambda: float = 0.0,
+        l2_lambda: float = 0.0,
     ):
         super(VAETPPLoss, self).__init__()
         self.device = device
         self.decoder = decoder
-        self.beta = beta
+        self.current_step = 0
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.n_steps = n_steps
+        self.warmup_steps = warmup_steps
         self.ignore_index = ignore_index
+        self.l1_lambda = l1_lambda
+        self.l2_lambda = l2_lambda
         self.event_loss = (
             nn.NLLLoss(
                 weight=event_weights, reduction="none", ignore_index=ignore_index
@@ -147,10 +122,66 @@ class VAETPPLoss(nn.Module):
             else nn.NLLLoss(reduction="none", ignore_index=ignore_index)
         )
 
+    def compute_l1_regularization(self, model: nn.Module) -> torch.Tensor:
+        """Compute L1 regularization for all parameters."""
+        l1_reg = torch.tensor(0.0, requires_grad=True, device=self.device)
+        for param in model.parameters():
+            l1_reg = l1_reg + torch.norm(param, 1)
+        return self.l1_lambda * l1_reg
+
+    def compute_l2_regularization(self, model: nn.Module) -> torch.Tensor:
+        """Compute L2 regularization for all parameters."""
+        l2_reg = torch.tensor(0.0, requires_grad=True, device=self.device)
+        for param in model.parameters():
+            l2_reg = l2_reg + torch.norm(param, 2)
+        return self.l2_lambda * l2_reg
+
+    def beta_schedule(
+        self,
+        step: int,
+        n_steps: int,
+        beta_start: float,
+        beta_end: float,
+        warmup_steps: int,
+    ) -> float:
+        """Linearly anneal beta from `beta_start` to `beta_end` over `n_steps`."""
+        if step <= warmup_steps:
+            return beta_start
+        else:
+            return min(
+                beta_end,
+                beta_start + (beta_end - beta_start) * (step - warmup_steps) / n_steps,
+            )
+
+    def cosine_beta_annealing_schedule(
+        self,
+        step: int,
+        n_steps: int,
+        beta_start: float,
+        beta_end: float,
+        warmup_steps: int,
+    ) -> float:
+        """Cyclic cosine annealing schedule for beta.
+
+        Args:
+            step (int): Current training step.
+            n_steps (int): Total number of training steps for one cycle.
+            beta_start (float): Initial beta value.
+            beta_end (float): Final beta value.
+            warmup_steps (int): Number of warmup steps.
+        """
+        if step <= warmup_steps:
+            return beta_start
+        else:
+            cycle_step = (step - warmup_steps) % n_steps
+            progress = cycle_step / n_steps
+            return beta_end + 0.5 * (beta_start - beta_end) * (
+                1 + torch.cos(torch.tensor(progress * 3.141592653589793))
+            )
+
     def create_sequence_mask(
         self, sequence_length: torch.LongTensor, max_len: int
     ) -> torch.BoolTensor:
-        """Create a boolean mask for variable length sequences."""
         mask = (
             torch.arange(max_len, device=sequence_length.device)[None, :]
             < sequence_length[:, None]
@@ -160,14 +191,16 @@ class VAETPPLoss(nn.Module):
     def compute_intensity_integral(
         self, time_output: torch.Tensor, time_delta: torch.Tensor
     ) -> torch.Tensor:
-        """Compute the integral of the intensity function over [0, time_delta]."""
         integral = (1.0 / self.decoder.intensity_w) * (
             torch.exp(
-                time_output
-                + self.decoder.intensity_w * time_delta
-                + self.decoder.intensity_b
+                torch.clamp(
+                    time_output
+                    + self.decoder.intensity_w * time_delta
+                    + self.decoder.intensity_b,
+                    max=10,
+                )
             )
-            - torch.exp(time_output + self.decoder.intensity_b)
+            - torch.exp(torch.clamp(time_output + self.decoder.intensity_b, max=10))
         )
         return integral
 
@@ -179,27 +212,22 @@ class VAETPPLoss(nn.Module):
         mark_target: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute TPP-specific losses (time and mark components)"""
-        # Compute intensity integral
         base_intensity = self.decoder.intensity_b
         intensity_integral = self.compute_intensity_integral(time_output, time_target)
 
-        # Negative log likelihood of TPP
+        # Time log-likelihood
         time_loglikelihood = (
             time_output
             + self.decoder.intensity_w * time_target
             + base_intensity
             - intensity_integral
         )
-
-        # Apply mask and compute time loss
         masked_time_loss = time_loglikelihood * mask
         negative_time_loglikelihood = -torch.sum(masked_time_loss) / mask.sum()
 
-        # Compute mark loss
+        # Mark loss
         mark_loss_per_event = self.event_loss(
-            mark_logits.view(-1, mark_logits.size(-1)),
-            mark_target.view(-1),
+            mark_logits.view(-1, mark_logits.size(-1)), mark_target.view(-1)
         )
         mark_loss_per_event = mark_loss_per_event.view_as(mark_target) * mask
         mark_loss = torch.sum(mark_loss_per_event) / mask.sum()
@@ -207,38 +235,21 @@ class VAETPPLoss(nn.Module):
         return negative_time_loglikelihood, mark_loss
 
     def KLDLoss(self, mu, logvar, mask):
-        """
-        Compute the KL divergence loss w masking
-        """
-        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        KLD = torch.sum(KLD, dim=-1)  # shape like [batch_size, seq_len]
-        # Now KLD and mask have same dimensions for multiplication
+        """KL divergence with masking."""
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
         maskedKLD = KLD * mask
         return maskedKLD.sum() / mask.sum()
-    
+
     def forward(
         self,
         decoder_output: VAEDecoderOutput,
         time_target: torch.Tensor,
         mark_target: torch.Tensor,
         sequence_length: torch.LongTensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute the combined VAE-TPP loss.
-
-        Args:
-            decoder_output: Output from the VAE decoder
-            time_target: True time deltas [batch_size, seq_len]
-            mark_target: True marks/event types [batch_size, seq_len]
-            sequence_length: Length of each sequence [batch_size]
-
-        Returns:
-            tuple: (time_loss, mark_loss, kl_loss, total_loss, elbo_loss)
-        """
-        # Create sequence mask
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mask = self.create_sequence_mask(sequence_length, time_target.size(1))
 
-        # Compute TPP-specific losses
+        # Loss computation
         time_loss, mark_loss = self.tppLoss(
             decoder_output.time_output.squeeze(),
             decoder_output.mark_logits,
@@ -246,12 +257,32 @@ class VAETPPLoss(nn.Module):
             mark_target,
             mask,
         )
-
-        # KL Divergence loss
         kld = self.KLDLoss(decoder_output.mu, decoder_output.logvar, mask)
 
-        # Reconstruction loss = sum of time and mark losses
-        recon = time_loss + mark_loss
-        elbo = recon + self.beta * kld
+        # add regularization
+        l1_reg = self.compute_l1_regularization(self.decoder)
+        l2_reg = self.compute_l2_regularization(self.decoder)
 
-        return time_loss, mark_loss, elbo #elbo is total loss
+        recon = time_loss + mark_loss + l1_reg + l2_reg
+
+        # beta = self.beta_schedule(
+        #     self.current_step,
+        #     self.n_steps,
+        #     self.beta_start,
+        #     self.beta_end,
+        #     self.warmup_steps,
+        # )
+
+        beta = self.cosine_beta_annealing_schedule(
+            self.current_step,
+            self.n_steps,
+            self.beta_start,
+            self.beta_end,
+            self.warmup_steps,
+        )
+
+        elbo = recon + beta * kld
+
+        self.current_step += 1
+
+        return time_loss, mark_loss, elbo
