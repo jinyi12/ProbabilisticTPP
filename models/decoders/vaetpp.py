@@ -4,8 +4,10 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from typing import Dict, Tuple, Optional, NamedTuple
 
+
 class VAEDecoderOutput(NamedTuple):
     """Container for decoder outputs to make the interface cleaner"""
+
     time_output: torch.Tensor  # Predicted time until next event
     mark_logits: torch.Tensor  # Log probabilities for marks
     base_intensity: torch.Tensor  # Base intensity values
@@ -23,7 +25,7 @@ class VAETPPDecoder(nn.Module):
             num_event_types (int): Number of event types for classification.
         """
         super().__init__()
-        
+
         self.fc1 = nn.Linear(n_in, n_hid)  # Input to hidden
         self.fc21 = nn.Linear(n_hid, z_dim)  # Hidden to latent mean
         self.fc22 = nn.Linear(n_hid, z_dim)  # Hidden to latent log variance
@@ -38,7 +40,6 @@ class VAETPPDecoder(nn.Module):
         # Activation functions
         self.softplus = nn.Softplus()
         self.silu = nn.SiLU()
-
 
     def encode(self, x, eps=1e-8):
         """Encoder forward pass: encodes input data to the latent space."""
@@ -56,7 +57,8 @@ class VAETPPDecoder(nn.Module):
 
     def decode(self, z):
         """Decoder forward pass: decodes latent space data to output space."""
-        h3 = self.silu(self.fc3(z))  # Activation with SiLU
+        # h3 = self.silu(self.fc3(z))  # Activation with SiLU
+        h3 = F.sigmoid(self.fc3(z))  # Activation with Sigmoid
         time_output = self.fc4_time(h3)  # Predict time until next event
         mark_logits = self.fc4_mark(h3)  # Predict event type logits
         return time_output, mark_logits
@@ -67,7 +69,7 @@ class VAETPPDecoder(nn.Module):
 
         Args:
             hidden_states (torch.Tensor): Input features (e.g., hidden states from an encoder).
-        
+
         Returns:
             VAEDecoderOutput: Predicted time, marks, and latent parameters.
         """
@@ -83,50 +85,92 @@ class VAETPPDecoder(nn.Module):
             mark_logits=mark_logits,
             base_intensity=self.intensity_b,
             mu=mu,
-            logvar=logvar
+            logvar=logvar,
         )
 
 
-
 class VAETPPLoss(nn.Module):
-    def __init__(self,
-                 device: torch.device,
-                 decoder: VAETPPDecoder,
-                 event_weights: Optional[torch.Tensor] = None,
-                 ignore_index: int = None,
-                 beta: float = 1.0):
+    def __init__(
+        self,
+        device: torch.device,
+        decoder: VAETPPDecoder,
+        event_weights: Optional[torch.Tensor] = None,
+        ignore_index: int = None,
+        beta_start=0.0,
+        beta_end=1.0,
+        n_steps: int = 1000,
+        l1_lambda: float = 0.0,
+        l2_lambda: float = 0.0,
+    ):
         super(VAETPPLoss, self).__init__()
         self.device = device
         self.decoder = decoder
-        self.beta = beta
+        self.current_step = 0
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+        self.n_steps = n_steps
         self.ignore_index = ignore_index
-        self.event_loss = nn.NLLLoss(
-            weight=event_weights, reduction="none", ignore_index=ignore_index
-        ) if event_weights is not None else nn.NLLLoss(reduction="none", ignore_index=ignore_index)
+        self.l1_lambda = l1_lambda
+        self.l2_lambda = l2_lambda
+        self.event_loss = (
+            nn.NLLLoss(
+                weight=event_weights, reduction="none", ignore_index=ignore_index
+            )
+            if event_weights is not None
+            else nn.NLLLoss(reduction="none", ignore_index=ignore_index)
+        )
 
-    def create_sequence_mask(self, sequence_length: torch.LongTensor, max_len: int) -> torch.BoolTensor:
+    def compute_l1_regularization(self, model: nn.Module) -> torch.Tensor:
+        """Compute L1 regularization for all parameters."""
+        l1_reg = torch.tensor(0.0, requires_grad=True, device=self.device)
+        for param in model.parameters():
+            l1_reg = l1_reg + torch.norm(param, 1)
+        return self.l1_lambda * l1_reg
+
+    def compute_l2_regularization(self, model: nn.Module) -> torch.Tensor:
+        """Compute L2 regularization for all parameters."""
+        l2_reg = torch.tensor(0.0, requires_grad=True, device=self.device)
+        for param in model.parameters():
+            l2_reg = l2_reg + torch.norm(param, 2)
+        return self.l2_lambda * l2_reg
+
+    def get_beta(self):
+        beta = min(self.current_step / self.n_steps, 1.0)
+        return self.beta_start + (self.beta_end - self.beta_start) * beta
+
+    def create_sequence_mask(
+        self, sequence_length: torch.LongTensor, max_len: int
+    ) -> torch.BoolTensor:
         mask = (
             torch.arange(max_len, device=sequence_length.device)[None, :]
             < sequence_length[:, None]
         )
         return mask
 
-    def compute_intensity_integral(self, time_output: torch.Tensor, time_delta: torch.Tensor) -> torch.Tensor:
+    def compute_intensity_integral(
+        self, time_output: torch.Tensor, time_delta: torch.Tensor
+    ) -> torch.Tensor:
         integral = (1.0 / self.decoder.intensity_w) * (
             torch.exp(
-                torch.clamp(time_output + self.decoder.intensity_w * time_delta + self.decoder.intensity_b, max=10)
-            ) - torch.exp(
-                torch.clamp(time_output + self.decoder.intensity_b, max=10)
+                torch.clamp(
+                    time_output
+                    + self.decoder.intensity_w * time_delta
+                    + self.decoder.intensity_b,
+                    max=10,
+                )
             )
+            - torch.exp(torch.clamp(time_output + self.decoder.intensity_b, max=10))
         )
         return integral
 
-    def tppLoss(self,
-                time_output: torch.Tensor,
-                mark_logits: torch.Tensor,
-                time_target: torch.Tensor,
-                mark_target: torch.Tensor,
-                mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def tppLoss(
+        self,
+        time_output: torch.Tensor,
+        mark_logits: torch.Tensor,
+        time_target: torch.Tensor,
+        mark_target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         base_intensity = self.decoder.intensity_b
         intensity_integral = self.compute_intensity_integral(time_output, time_target)
 
@@ -142,8 +186,7 @@ class VAETPPLoss(nn.Module):
 
         # Mark loss
         mark_loss_per_event = self.event_loss(
-            mark_logits.view(-1, mark_logits.size(-1)),
-            mark_target.view(-1)
+            mark_logits.view(-1, mark_logits.size(-1)), mark_target.view(-1)
         )
         mark_loss_per_event = mark_loss_per_event.view_as(mark_target) * mask
         mark_loss = torch.sum(mark_loss_per_event) / mask.sum()
@@ -156,11 +199,13 @@ class VAETPPLoss(nn.Module):
         maskedKLD = KLD * mask
         return maskedKLD.sum() / mask.sum()
 
-    def forward(self,
-                decoder_output: VAEDecoderOutput,
-                time_target: torch.Tensor,
-                mark_target: torch.Tensor,
-                sequence_length: torch.LongTensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        decoder_output: VAEDecoderOutput,
+        time_target: torch.Tensor,
+        mark_target: torch.Tensor,
+        sequence_length: torch.LongTensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         mask = self.create_sequence_mask(sequence_length, time_target.size(1))
 
         # Loss computation
@@ -169,10 +214,18 @@ class VAETPPLoss(nn.Module):
             decoder_output.mark_logits,
             time_target,
             mark_target,
-            mask
+            mask,
         )
         kld = self.KLDLoss(decoder_output.mu, decoder_output.logvar, mask)
-        recon = time_loss + mark_loss
-        elbo = recon + self.beta * kld
+
+        # add regularization
+        l1_reg = self.compute_l1_regularization(self.decoder)
+        l2_reg = self.compute_l2_regularization(self.decoder)
+
+        recon = time_loss + mark_loss + l1_reg + l2_reg
+        beta = self.get_beta()
+        elbo = recon + beta * kld
+
+        self.current_step += 1
 
         return time_loss, mark_loss, elbo

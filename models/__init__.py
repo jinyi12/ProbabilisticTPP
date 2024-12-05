@@ -31,20 +31,39 @@ class TPPModel(nn.Module):
             batch["sequence_length"],
         )
         return time_loss, mark_loss, total_loss
-    
+
 
 class VAETPPModel(nn.Module):
-    def __init__(self, config, hidden_dim, latent_dim, mlp_dim, device):
+    def __init__(
+        self,
+        config,
+        hidden_dim,
+        latent_dim,
+        mlp_dim,
+        device,
+        beta_start=0,
+        beta_end=1,
+        beta_steps=1000,
+        l1_lambda=0,
+        l2_lambda=0,
+    ):
         super(VAETPPModel, self).__init__()
         self.encoder = GRUTPPEncoder(config, hidden_dim=hidden_dim)
         self.decoder = VAETPPDecoder(
-            n_in=hidden_dim,             
-            n_hid=mlp_dim,              
-            z_dim=latent_dim,            
-            num_event_types=config.num_event_types
+            n_in=hidden_dim,
+            n_hid=mlp_dim,
+            z_dim=latent_dim,
+            num_event_types=config.num_event_types,
         )
         self.criterion = VAETPPLoss(
-            device=device, ignore_index=config.pad_token_id, decoder=self.decoder
+            device=device,
+            ignore_index=config.pad_token_id,
+            decoder=self.decoder,
+            beta_start=beta_start,
+            beta_end=beta_end,
+            n_steps=beta_steps,
+            l1_lambda=l1_lambda,
+            l2_lambda=l2_lambda,
         )
 
     def forward(self, batch):
@@ -60,4 +79,3 @@ class VAETPPModel(nn.Module):
             batch["sequence_length"],
         )
         return time_loss, mark_loss, elbo
-
