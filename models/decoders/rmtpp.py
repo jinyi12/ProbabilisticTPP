@@ -7,7 +7,7 @@ from typing import Dict, Tuple, Optional, NamedTuple
 class DecoderOutput(NamedTuple):
     """Container for decoder outputs to make the interface cleaner"""
 
-    time_output: torch.Tensor  # Predicted time until next event
+    time_logits: torch.Tensor  # Predicted time logits until next event
     # time_delta: torch.Tensor  # Predicted time delta
     mark_logits: torch.Tensor  # Log probabilities for marks
     # intensity_integral: torch.Tensor  # Integral of intensity function
@@ -64,7 +64,7 @@ class RMTPPDecoder(nn.Module):
         mlp_output = self.mlp(hidden_states)
 
         # Get base intensity and time prediction
-        time_output = self.time_projection(mlp_output)
+        time_logits = self.time_projection(mlp_output)
         base_intensity = self.intensity_b
 
         # Compute mark probabilities
@@ -72,7 +72,7 @@ class RMTPPDecoder(nn.Module):
         mark_logits = F.log_softmax(mark_logits, dim=-1)
 
         return DecoderOutput(
-            time_output=time_output,
+            time_logits=time_logits,
             mark_logits=mark_logits,
             base_intensity=base_intensity,
         )
@@ -123,7 +123,7 @@ class RMTPPLoss(nn.Module):
         return mask
 
     def compute_intensity_integral(
-        self, time_output: torch.Tensor, time_delta: torch.Tensor
+        self, time_logits: torch.Tensor, time_delta: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute the integral of the intensity function over [0, time_delta].
@@ -138,11 +138,11 @@ class RMTPPLoss(nn.Module):
         # Compute integral using the closed form solution
         integral = (1.0 / self.decoder.intensity_w) * (
             torch.exp(
-                time_output
+                time_logits
                 + self.decoder.intensity_w * time_delta
                 + self.decoder.intensity_b
             )
-            - torch.exp(time_output + self.decoder.intensity_b)
+            - torch.exp(time_logits + self.decoder.intensity_b)
         )
         return integral
 
@@ -172,13 +172,13 @@ class RMTPPLoss(nn.Module):
         mask = self.create_sequence_mask(sequence_length, time_target.size(1))
 
         # compute intensity integral
-        time_output = decoder_output.time_output.squeeze()
+        time_logits = decoder_output.time_logits.squeeze()
         base_intensity = self.decoder.intensity_b
-        intensity_integral = self.compute_intensity_integral(time_output, time_target)
+        intensity_integral = self.compute_intensity_integral(time_logits, time_target)
 
         # log likelihood of TPP
         time_loglikelihood = (
-            time_output
+            time_logits
             + self.decoder.intensity_w * time_target
             + base_intensity
             + -1.0 * intensity_integral

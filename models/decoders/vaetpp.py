@@ -8,7 +8,7 @@ from typing import Dict, Tuple, Optional, NamedTuple
 class VAEDecoderOutput(NamedTuple):
     """Container for decoder outputs to make the interface cleaner"""
 
-    time_output: torch.Tensor  # Predicted time until next event
+    time_logits: torch.Tensor  # Predicted time until next event
     mark_logits: torch.Tensor  # Log probabilities for marks
     base_intensity: torch.Tensor  # Base intensity values
     mu: torch.Tensor
@@ -57,11 +57,10 @@ class VAETPPDecoder(nn.Module):
 
     def decode(self, z):
         """Decoder forward pass: decodes latent space data to output space."""
-        # h3 = self.silu(self.fc3(z))  # Activation with SiLU
-        h3 = F.sigmoid(self.fc3(z))  # Activation with Sigmoid
-        time_output = self.fc4_time(h3)  # Predict time until next event
+        h3 = F.sigmoid(self.fc3(z))  # Activation with Sigmoid for logit outputs
+        time_logits = self.fc4_time(h3)  # Predict time logits until next event
         mark_logits = self.fc4_mark(h3)  # Predict event type logits
-        return time_output, mark_logits
+        return time_logits, mark_logits
 
     def forward(self, hidden_states: torch.Tensor) -> VAEDecoderOutput:
         """
@@ -75,13 +74,13 @@ class VAETPPDecoder(nn.Module):
         """
         mu, logvar = self.encode(hidden_states)  # Encode to latent space
         z = self.reparameterize(mu, logvar)  # Sample latent representation
-        time_output, mark_logits = self.decode(z)  # Decode to outputs
+        time_logits, mark_logits = self.decode(z)  # Decode to outputs
 
         mark_logits = F.log_softmax(mark_logits, dim=-1)  # Log probabilities for marks
 
         # Return predictions and latent space parameters
         return VAEDecoderOutput(
-            time_output=time_output,
+            time_logits=time_logits,
             mark_logits=mark_logits,
             base_intensity=self.intensity_b,
             mu=mu,
@@ -189,35 +188,35 @@ class VAETPPLoss(nn.Module):
         return mask
 
     def compute_intensity_integral(
-        self, time_output: torch.Tensor, time_delta: torch.Tensor
+        self, time_logits: torch.Tensor, time_delta: torch.Tensor
     ) -> torch.Tensor:
         integral = (1.0 / self.decoder.intensity_w) * (
             torch.exp(
                 torch.clamp(
-                    time_output
+                    time_logits
                     + self.decoder.intensity_w * time_delta
                     + self.decoder.intensity_b,
                     max=10,
                 )
             )
-            - torch.exp(torch.clamp(time_output + self.decoder.intensity_b, max=10))
+            - torch.exp(torch.clamp(time_logits + self.decoder.intensity_b, max=10))
         )
         return integral
 
     def tppLoss(
         self,
-        time_output: torch.Tensor,
+        time_logits: torch.Tensor,
         mark_logits: torch.Tensor,
         time_target: torch.Tensor,
         mark_target: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         base_intensity = self.decoder.intensity_b
-        intensity_integral = self.compute_intensity_integral(time_output, time_target)
+        intensity_integral = self.compute_intensity_integral(time_logits, time_target)
 
         # Time log-likelihood
         time_loglikelihood = (
-            time_output
+            time_logits
             + self.decoder.intensity_w * time_target
             + base_intensity
             - intensity_integral
@@ -251,7 +250,7 @@ class VAETPPLoss(nn.Module):
 
         # Loss computation
         time_loss, mark_loss = self.tppLoss(
-            decoder_output.time_output.squeeze(),
+            decoder_output.time_logits.squeeze(),
             decoder_output.mark_logits,
             time_target,
             mark_target,
