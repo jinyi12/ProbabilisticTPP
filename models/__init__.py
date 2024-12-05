@@ -44,6 +44,7 @@ class VAETPPModel(nn.Module):
         beta_start=0,
         beta_end=1,
         beta_steps=1000,
+        warmup_steps=1000,
         l1_lambda=0,
         l2_lambda=0,
     ):
@@ -62,6 +63,7 @@ class VAETPPModel(nn.Module):
             beta_start=beta_start,
             beta_end=beta_end,
             n_steps=beta_steps,
+            warmup_steps=warmup_steps,
             l1_lambda=l1_lambda,
             l2_lambda=l2_lambda,
         )

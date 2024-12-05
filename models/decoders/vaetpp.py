@@ -99,6 +99,7 @@ class VAETPPLoss(nn.Module):
         beta_start=0.0,
         beta_end=1.0,
         n_steps: int = 1000,
+        warmup_steps: int = 1000,
         l1_lambda: float = 0.0,
         l2_lambda: float = 0.0,
     ):
@@ -109,6 +110,7 @@ class VAETPPLoss(nn.Module):
         self.beta_start = beta_start
         self.beta_end = beta_end
         self.n_steps = n_steps
+        self.warmup_steps = warmup_steps
         self.ignore_index = ignore_index
         self.l1_lambda = l1_lambda
         self.l2_lambda = l2_lambda
@@ -134,9 +136,48 @@ class VAETPPLoss(nn.Module):
             l2_reg = l2_reg + torch.norm(param, 2)
         return self.l2_lambda * l2_reg
 
-    def get_beta(self):
-        beta = min(self.current_step / self.n_steps, 1.0)
-        return self.beta_start + (self.beta_end - self.beta_start) * beta
+    def beta_schedule(
+        self,
+        step: int,
+        n_steps: int,
+        beta_start: float,
+        beta_end: float,
+        warmup_steps: int,
+    ) -> float:
+        """Linearly anneal beta from `beta_start` to `beta_end` over `n_steps`."""
+        if step <= warmup_steps:
+            return beta_start
+        else:
+            return min(
+                beta_end,
+                beta_start + (beta_end - beta_start) * (step - warmup_steps) / n_steps,
+            )
+
+    def cosine_beta_annealing_schedule(
+        self,
+        step: int,
+        n_steps: int,
+        beta_start: float,
+        beta_end: float,
+        warmup_steps: int,
+    ) -> float:
+        """Cyclic cosine annealing schedule for beta.
+
+        Args:
+            step (int): Current training step.
+            n_steps (int): Total number of training steps for one cycle.
+            beta_start (float): Initial beta value.
+            beta_end (float): Final beta value.
+            warmup_steps (int): Number of warmup steps.
+        """
+        if step <= warmup_steps:
+            return beta_start
+        else:
+            cycle_step = (step - warmup_steps) % n_steps
+            progress = cycle_step / n_steps
+            return beta_end + 0.5 * (beta_start - beta_end) * (
+                1 + torch.cos(torch.tensor(progress * 3.141592653589793))
+            )
 
     def create_sequence_mask(
         self, sequence_length: torch.LongTensor, max_len: int
@@ -223,7 +264,23 @@ class VAETPPLoss(nn.Module):
         l2_reg = self.compute_l2_regularization(self.decoder)
 
         recon = time_loss + mark_loss + l1_reg + l2_reg
-        beta = self.get_beta()
+
+        # beta = self.beta_schedule(
+        #     self.current_step,
+        #     self.n_steps,
+        #     self.beta_start,
+        #     self.beta_end,
+        #     self.warmup_steps,
+        # )
+
+        beta = self.cosine_beta_annealing_schedule(
+            self.current_step,
+            self.n_steps,
+            self.beta_start,
+            self.beta_end,
+            self.warmup_steps,
+        )
+
         elbo = recon + beta * kld
 
         self.current_step += 1
