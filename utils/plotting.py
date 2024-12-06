@@ -24,14 +24,16 @@ def plot_seqs(time_seqs, type_seqs, time_delta_seqs, sequence_length, calculated
         seq_len = sequence_length[i].item()
         pred_time_delta_seq = calculated_deltas[i].detach().cpu().numpy() if isinstance(calculated_deltas, torch.Tensor) else calculated_deltas
         pred_mark_logits = decoder_output.mark_logits[i].detach().cpu().numpy()
-
+        
+        #Plotting true, predicted event types
         axs[i, 0].plot(time_seq[:seq_len], type_seq[:seq_len], 'o-', label='True')
         axs[i, 0].plot(time_seq[:seq_len], np.argmax(pred_mark_logits[:seq_len], axis=-1), 'o-', label='Predicted')
         axs[i, 0].set_xlabel('Time')
         axs[i, 0].set_ylabel('Event Type')
         axs[i, 0].set_title(f'Sample {i+1} - Event Sequence')
         axs[i, 0].legend()
-
+        
+        #Plotting true, predicted time deltas
         axs[i, 1].plot(time_seq[:seq_len], time_delta_seq[:seq_len], 'o-', label='True')
         axs[i, 1].plot(time_seq[:seq_len], pred_time_delta_seq[:seq_len], 'o-', label='Calculated')
         axs[i, 1].set_xlabel('Time')
@@ -92,7 +94,8 @@ def plot_seqs_both(
 
         pred_event_types_tpp = torch.argmax(decoder_output_tpp.mark_logits[i], dim=-1).detach().cpu().numpy()
         pred_event_types_vae = torch.argmax(decoder_output_vae.mark_logits[i], dim=-1).detach().cpu().numpy()
-
+    
+        # Plotting true, predicted event types
         axes[i, 0].plot(time_seq[:seq_len], type_seq[:seq_len], "o-", label="True")
         axes[i, 0].plot(
             time_seq[:seq_len],
@@ -110,7 +113,8 @@ def plot_seqs_both(
         axes[i, 0].set_ylabel("Event Type")
         axes[i, 0].set_title(f"Event Sequence {i+1}")
         axes[i, 0].legend()
-
+        
+        # Plotting true, predicted time deltas
         axes[i, 1].plot(time_seq[:seq_len], time_delta_seq[:seq_len], "o-", label="True")
         axes[i, 1].plot(
             time_seq[:seq_len],
@@ -300,7 +304,7 @@ def plot_latent_space_tpp(model, data_loader, device, file_name=None):
     plt.show()
     
     
-def plot_samples_vae(model, data_loader, device, max_samples=100):
+def plot_samples_vae(model, data_loader, device, max_samples=100, file_name=None):
     model.eval()
     
     batch = next(iter(data_loader))
@@ -341,6 +345,7 @@ def plot_samples_vae(model, data_loader, device, max_samples=100):
     samples = np.stack(samples)
     sample_types = np.array(sample_types)
     
+    # Reduce dimensionality using t-SNE
     tsne = TSNE(n_components=2, random_state=42)
     samples_2d = tsne.fit_transform(samples)
     
@@ -353,7 +358,7 @@ def plot_samples_vae(model, data_loader, device, max_samples=100):
     for idx, event_type in enumerate(np.unique(event_types)):
         mask = sample_types == event_type
         points = samples_2d[mask]
-        
+        # Kernal density estimation to estimate pdf
         kde = gaussian_kde(points.T)
         x_min, x_max = points[:, 0].min() - 0.5, points[:, 0].max() + 0.5
         y_min, y_max = points[:, 1].min() - 0.5, points[:, 1].max() + 0.5
@@ -362,6 +367,7 @@ def plot_samples_vae(model, data_loader, device, max_samples=100):
         y = np.linspace(y_min, y_max, 50)
         X, Y = np.meshgrid(x, y)
         positions = np.vstack([X.ravel(), Y.ravel()])
+        
         Z = kde(positions).reshape(X.shape)
         
         color = colors[idx % len(colors)]
@@ -373,6 +379,7 @@ def plot_samples_vae(model, data_loader, device, max_samples=100):
     plt.grid(True, linestyle='--', alpha=0.3)
     plt.legend()
     plt.title('Samples from VAETPP latent space')
-    plt.savefig('vae_latent_space_samples.png')
     plt.show()
+    if file_name:
+        plt.savefig(file_name)
     return plt.gcf()
