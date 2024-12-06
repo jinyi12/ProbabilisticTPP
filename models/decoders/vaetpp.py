@@ -271,7 +271,8 @@ class VAETPPLoss(nn.Module):
         #     self.beta_end,
         #     self.warmup_steps,
         # )
-
+        
+        #using cosine scheduled beta annealing
         beta = self.cosine_beta_annealing_schedule(
             self.current_step,
             self.n_steps,
